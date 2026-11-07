@@ -18,11 +18,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"slices"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -30,8 +32,11 @@ import (
 	"github.com/multigres/multigres/go/common/constants"
 	"github.com/multigres/multigres/go/common/servenv"
 	"github.com/multigres/multigres/go/common/topoclient"
+	clustermetadatapb "github.com/multigres/multigres/go/pb/clustermetadata"
 	"github.com/multigres/multigres/go/services/multigateway"
+	"github.com/multigres/multigres/go/services/multigateway/poolergateway"
 	"github.com/multigres/multigres/go/services/multipooler"
+	"github.com/multigres/multigres/go/tools/ctxutil"
 	"github.com/multigres/multigres/go/tools/telemetry"
 	"github.com/multigres/multigres/go/tools/viperutil"
 )
@@ -48,13 +53,16 @@ var omittedPoolerFlags = []string{"pg-port"}
 
 // minigres holds the pieces both halves share and the two halves themselves.
 type minigres struct {
-	// reg is the process registry, which holds the settings of the shared
-	// servenv, gRPC server and topology configuration.
-	reg        *viperutil.Registry
-	senv       *servenv.ServEnv
+	// reg is the process registry. It holds the settings of the shared
+	// servenv, gRPC server and topology configuration, and, through a view
+	// per half, each half's settings behind the half's name (see config.go).
+	reg  *viperutil.Registry
+	senv *servenv.ServEnv
+	// grpcServer, on the TCP port, carries only the admin services. The
+	// query service is not served over gRPC: the gateway calls the pooler
+	// directly.
 	grpcServer *servenv.GrpcServer
 	topoConfig *topoclient.TopoConfig
-	ts         topoclient.Store
 
 	gateway *multigateway.Multigateway
 	pooler  *multipooler.Multipooler
@@ -77,13 +85,30 @@ func newMinigres() *minigres {
 		poolerFlags: pflag.NewFlagSet(constants.ServiceMultipooler, pflag.ContinueOnError),
 	}
 	// One value for both halves, so they cannot be given different servers.
+	// No QueryGrpcServer: the pooler's query service is served only to the
+	// gateway in this process.
 	resources := servenv.ProcessResources{
 		ServEnv:    m.senv,
 		GrpcServer: m.grpcServer,
-		TopoStore:  func() topoclient.Store { return m.ts },
+		// run sequences the halves' shutdown (see shutdown).
+		SequencedShutdown: true,
 	}
-	m.pooler = multipooler.NewMultipooler(tel, multipooler.WithSingleProcessMode(resources))
-	m.gateway = multigateway.NewMultigateway(multigateway.WithSingleProcessMode(resources))
+	// The only pooler of its shard leads it without consensus.
+	// Each half configures its settings on a view of the process registry
+	// behind its own name: both define keys such as pg-port with different
+	// meanings, so one config file sets them as multigateway.pg-port and
+	// multipooler.pg-port.
+	m.pooler = multipooler.NewMultipooler(tel, reg.WithPrefix(constants.ServiceMultipooler), resources, "/"+constants.ServiceMultipooler, true)
+	// The multigateway uses only the multipooler in this process: it reads the
+	// pooler's record in memory instead of through the topology, and calls the
+	// pooler directly, with no gRPC in between. It is the only gateway in front
+	// of the only pooler, so what needs several of either is turned off.
+	localPooler := &poolergateway.LocalPooler{
+		ID:      m.poolerID,
+		Record:  m.pooler.Record,
+		Service: m.pooler.LocalPoolerService(),
+	}
+	m.gateway = multigateway.NewMultigateway(reg.WithPrefix(constants.ServiceMultigateway), resources, "/"+constants.ServiceMultigateway, localPooler)
 	return m
 }
 
@@ -151,21 +176,18 @@ func (m *minigres) preRun(cmd *cobra.Command) error {
 	if err := copySharedFlags(fs, m.poolerFlags); err != nil {
 		return err
 	}
+	if err := checkEnvClashes(m.reg); err != nil {
+		return err
+	}
+	m.reg.SetConfigPreparer(prepareConfig(m.reg))
 	if err := m.gateway.CobraPreRunE(cmd); err != nil {
 		return err
 	}
-	if err := m.pooler.CobraPreRunE(cmd); err != nil {
-		return err
-	}
+	// The multipooler has no CobraPreRunE of its own (unlike the multigateway,
+	// which needs one for its config-reload channel) — it never constructs its
+	// own servenv, so there is nothing for it to suppress here.
 	if err := m.senv.CobraPreRunE(cmd); err != nil {
 		return err
-	}
-	// A config file is read only into the process registry: each half keeps its
-	// own registry, because both define keys such as pg-port with different
-	// meanings. Component settings in a file would be silently ignored, so refuse
-	// the file until the halves have separate configuration namespaces.
-	if file := m.reg.ConfigFileLoaded(); file != "" {
-		return fmt.Errorf("config file %s: minigres does not support configuration files yet (MUL-1663); use flags or MT_* environment variables", file)
 	}
 	return ensureServiceID(fs, m.poolerFlags, m.pooler.ServiceIdentity().ServiceInstanceID)
 }
@@ -193,7 +215,6 @@ func (m *minigres) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("topo open: %w", err)
 	}
-	m.ts = ts
 	// Closed only after the serving loop returns, which is after both halves'
 	// shutdown hooks have run.
 	defer ts.Close()
@@ -207,14 +228,58 @@ func (m *minigres) run(ctx context.Context) error {
 		return fmt.Errorf("servenv init: %w", err)
 	}
 
-	if err := m.pooler.Init(ctx); err != nil {
+	if err := m.pooler.Init(ctx, ts); err != nil {
 		return err
 	}
-	if err := m.gateway.Init(ctx); err != nil {
+	if err := m.gateway.Init(ctx, ts); err != nil {
 		return err
 	}
+	m.senv.OnTermSync(func() { m.shutdown(ctx) })
+	// The multipooler's own ready check leaves PostgreSQL out, and the
+	// multigateway's passes once it has the pooler's record, so together they
+	// report ready before a query can succeed: while the pooler starts
+	// PostgreSQL, or for as long as PostgreSQL cannot start. The pooler is the
+	// only one clients reach, so Minigres reports ready only once the gateway
+	// has seen it serving. It then stays ready if PostgreSQL goes down, as the
+	// multipooler does: clients get an error instead of no connection.
+	m.senv.RegisterReadyCheck(func() error {
+		if !m.gateway.LeaderServed() {
+			return errors.New("pooler has not served yet")
+		}
+		return nil
+	})
 	m.senv.HTTPHandleFunc("/", handleIndex)
 	return m.senv.RunDefault(m.grpcServer)
+}
+
+// shutdown stops both halves on SIGTERM, the gateway first, so clients see
+// what a standalone multigateway in front of a standalone multipooler gives
+// them. First the lameduck period (--lameduck-period): both halves keep
+// serving, and new connections are still accepted, as a standalone
+// multigateway does until its OnClose hooks run. Then the gateway stops
+// accepting connections and waits for the open ones to end, for at most
+// --onclose-timeout, the bound servenv gives a standalone multigateway's
+// shutdown, and cuts the rest, as that process exiting would. Only then does
+// the pooler stop serving and stop PostgreSQL. Run in parallel, as their own
+// hooks, the pooler would refuse the open connections' queries until the
+// gateway closed them. servenv sleeps only what is left of the lameduck
+// period after OnTermSync, so it is not waited twice.
+func (m *minigres) shutdown(ctx context.Context) {
+	time.Sleep(m.senv.LameduckPeriod())
+	drainCtx, cancel := context.WithTimeout(ctxutil.Detach(ctx), m.senv.OnCloseTimeout())
+	defer cancel()
+	m.gateway.Shutdown(drainCtx)
+	m.pooler.GracefulShutdown()
+}
+
+// poolerID is the multipooler's topology ID, as it registers itself.
+func (m *minigres) poolerID() *clustermetadatapb.ID {
+	id := m.pooler.ServiceIdentity()
+	return &clustermetadatapb.ID{
+		Component: clustermetadatapb.ID_MULTIPOOLER,
+		Cell:      id.Cell,
+		Name:      id.ServiceInstanceID,
+	}
 }
 
 // handleIndex links to both halves' status pages, which a shared servenv

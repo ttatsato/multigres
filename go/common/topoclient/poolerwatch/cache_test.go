@@ -83,7 +83,7 @@ func pool(cell, name, db, tg, shard string, lifecycle clustermetadatapb.PoolerLi
 			Cell:      cell,
 			Name:      name,
 		},
-		ShardKey: &clustermetadatapb.ShardKey{
+		ShardRef: &clustermetadatapb.ShardRef{
 			Database:   db,
 			TableGroup: tg,
 			Shard:      shard,
@@ -363,6 +363,30 @@ func TestCache_GetByShardAndCellExcludeShutdownPoolers(t *testing.T) {
 	assert.Equal(t, "alive", shard[0].Pooler.Id.Name)
 }
 
+// TestCache_HasDatabaseTracksShardIndex covers the read used to tell an unknown
+// database from a known one whose poolers are unroutable. It follows the same
+// read-visibility rule as GetByShard: a SHUTDOWN pooler leaves the index, and
+// with it the database it was the last member of.
+func TestCache_HasDatabaseTracksShardIndex(t *testing.T) {
+	clk := newFakeClock()
+	c, _ := newTestCache(t, clk, time.Hour, time.Hour)
+	defer c.Shutdown()
+
+	assert.False(t, c.HasDatabase("db"), "an empty cache knows no database")
+
+	c.applyUpsert(pool("zone1", "p1", "db", "tg", "0", clustermetadatapb.PoolerLifecycleStatus_LIFECYCLE_ACTIVE))
+	assert.True(t, c.HasDatabase("db"))
+	assert.False(t, c.HasDatabase("other_db"))
+
+	// A second shard of the same database keeps it known once the first goes.
+	c.applyUpsert(pool("zone1", "p2", "db", "tg", "1", clustermetadatapb.PoolerLifecycleStatus_LIFECYCLE_ACTIVE))
+	c.applyUpsert(pool("zone1", "p1", "db", "tg", "0", clustermetadatapb.PoolerLifecycleStatus_LIFECYCLE_SHUTDOWN))
+	assert.True(t, c.HasDatabase("db"), "the database still has a shard with a live pooler")
+
+	c.applyUpsert(pool("zone1", "p2", "db", "tg", "1", clustermetadatapb.PoolerLifecycleStatus_LIFECYCLE_SHUTDOWN))
+	assert.False(t, c.HasDatabase("db"), "the last read-visible pooler left the database")
+}
+
 func TestCache_ShutdownDisposesEverythingRemaining(t *testing.T) {
 	clk := newFakeClock()
 	c, rec := newTestCache(t, clk, time.Hour, time.Hour)
@@ -491,7 +515,7 @@ func TestCache_FilterDropsNonMatchingPoolers(t *testing.T) {
 	rec := &hookRecorder{}
 	cfg := Config[*testRider]{
 		Filter: func(p *clustermetadatapb.Multipooler) bool {
-			return p.GetShardKey().GetDatabase() == "mydb"
+			return p.GetShardRef().GetDatabase() == "mydb"
 		},
 		ShutdownGrace:      time.Hour,
 		MissingGracePeriod: time.Hour,
@@ -781,7 +805,7 @@ func TestCache_StartIntegratesWithMemoryTopo(t *testing.T) {
 	// must be visible via Get / GetRider / All / CellStatuses.
 	p1 := &clustermetadatapb.Multipooler{
 		Id:       &clustermetadatapb.ID{Component: clustermetadatapb.ID_MULTIPOOLER, Cell: "zone1", Name: "p1"},
-		ShardKey: &clustermetadatapb.ShardKey{Database: "db", TableGroup: "tg", Shard: "0"},
+		ShardRef: &clustermetadatapb.ShardRef{Database: "db", TableGroup: "tg", Shard: "0"},
 		Hostname: "p1.local",
 	}
 	require.NoError(t, ts.CreateMultipooler(ctx, p1))
@@ -809,7 +833,7 @@ func TestCache_StartIntegratesWithMemoryTopo(t *testing.T) {
 	require.NoError(t, factory.AddCell(ctx, ts, "zone2"))
 	p2 := &clustermetadatapb.Multipooler{
 		Id:       &clustermetadatapb.ID{Component: clustermetadatapb.ID_MULTIPOOLER, Cell: "zone2", Name: "p2"},
-		ShardKey: &clustermetadatapb.ShardKey{Database: "db", TableGroup: "tg", Shard: "0"},
+		ShardRef: &clustermetadatapb.ShardRef{Database: "db", TableGroup: "tg", Shard: "0"},
 		Hostname: "p2.local",
 	}
 	require.NoError(t, ts.CreateMultipooler(ctx, p2))
@@ -838,4 +862,42 @@ func TestCache_StartIntegratesWithMemoryTopo(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return cache.topoSource.broadcaster.cellCount() < beforeCells
 	}, 2*time.Second, 5*time.Millisecond, "onCellRemoved must deregister the zone2 watcher")
+}
+
+// TestCache_PoolersKnownUpFront tracks the given poolers from Start, without a
+// topology watch, and disposes of them on Shutdown.
+func TestCache_PoolersKnownUpFront(t *testing.T) {
+	rec := &hookRecorder{}
+	c := New(t.Context(), Config[*testRider]{
+		Poolers: []*clustermetadatapb.Multipooler{
+			pool("zone1", "p1", "db", "tg", "0", clustermetadatapb.PoolerLifecycleStatus_LIFECYCLE_ACTIVE),
+		},
+		Logger: silentLogger(),
+	})
+	c.Start(Hooks[*testRider]{
+		OnLive: func(p *clustermetadatapb.Multipooler, _ *testRider) *testRider {
+			rec.record("live:" + p.Id.Name)
+			return newRider()
+		},
+		OnGone: func(p *clustermetadatapb.Multipooler, _ *testRider, r GoneReason) {
+			rec.record("gone-" + r.String() + ":" + p.Id.Name)
+		},
+	})
+	assert.Nil(t, c.topoSource, "no topology watch")
+	assert.Equal(t, []string{"live:p1"}, rec.snapshot())
+
+	c.Shutdown()
+	assert.Len(t, rec.snapshot(), 2, "Shutdown disposes of the pooler")
+}
+
+func TestCache_SourceAndPoolersAreMutuallyExclusive(t *testing.T) {
+	ts, _ := memorytopo.NewServerAndFactory(t.Context(), "zone1")
+	defer ts.Close()
+	assert.PanicsWithValue(t, "poolerwatch: Config.Source and Config.Poolers are mutually exclusive", func() {
+		New(t.Context(), Config[*testRider]{
+			Source:  ts,
+			Poolers: []*clustermetadatapb.Multipooler{pool("zone1", "p1", "db", "tg", "0", clustermetadatapb.PoolerLifecycleStatus_LIFECYCLE_ACTIVE)},
+			Logger:  silentLogger(),
+		})
+	})
 }

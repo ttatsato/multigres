@@ -40,10 +40,9 @@ import (
 	"github.com/multigres/multigres/go/test/endtoend/testconst"
 
 	"github.com/multigres/multigres/go/cmd/pgctld/testutil"
-	"github.com/multigres/multigres/go/common/consensus"
 	"github.com/multigres/multigres/go/common/constants"
 	"github.com/multigres/multigres/go/common/topoclient"
-	"github.com/multigres/multigres/go/common/topoclient/etcdtopo"
+	"github.com/multigres/multigres/go/test/endtoend/clustersetup"
 	"github.com/multigres/multigres/go/test/utils"
 	"github.com/multigres/multigres/go/tools/executil"
 	"github.com/multigres/multigres/go/tools/stringutil"
@@ -61,37 +60,35 @@ import (
 
 // SetupConfig holds the configuration for creating a ShardSetup.
 type SetupConfig struct {
-	MultipoolerCount                   int
-	MultiorchCount                     int
-	EnableMultigateway                 bool // Enable multigateway (opt-in, default: false)
-	EnableMultiadmin                   bool // Enable multiadmin (opt-in, default: false)
-	EnableMultigatewayTLS              bool // Enable TLS for multigateway PostgreSQL listener
-	EnableMultipoolerPGTLS             bool // Provision postgres with TLS and point multipooler at it via verify-full
-	MultipoolerPGTLSDirect             bool // With EnableMultipoolerPGTLS: dial postgres with sslnegotiation=direct (PG 17 TLS-first)
-	Database                           string
-	TableGroup                         string
-	Shard                              string
-	CellName                           string
-	DurabilityPolicy                   string   // Durability policy (e.g., "AT_LEAST_2")
-	SkipInitialization                 bool     // Start processes but don't initialize postgres (for bootstrap tests)
-	DeferMultipoolerStart              bool     // Start pgctld only; test starts multipooler itself
-	LeaderFailoverGracePeriodBase      string   // Grace period base before leader failover (default: "0s" for tests)
-	LeaderFailoverGracePeriodMaxJitter string   // Max jitter for grace period (default: "0s" for tests)
-	RequireFailureSafeInitialCohort    bool     // Reject bootstrapping a cohort that can't survive losing any member (default: false — tests allow it for speed/small pooler counts)
-	S3BackupBucket                     string   // S3 bucket name (empty = use filesystem)
-	S3BackupRegion                     string   // S3 region
-	S3BackupEndpoint                   string   // S3 endpoint (empty = use AWS, otherwise s3mock/custom)
-	RequireBackupEncryption            bool     // Generate a cipher key file and require initial-repo encryption
-	EnableMultigatewayReplicaPort      bool     // Enable replica-reads port on multigateway
-	MultigatewayExtraArgs              []string // Extra CLI flags for multigateway (e.g., buffer config)
-	MultipoolerExtraArgs               []string // Extra CLI flags appended to every multipooler (e.g., connpool capacity/timeout flags)
-	OTelCollectorEndpoint              string   // OTLP HTTP endpoint for multigateway span export (empty = disabled)
-	EnableMetricsExport                bool     // Enable Prometheus metrics export on all services
-	LogLevel                           string   // --log-level for multipooler/multiorch/multigateway (empty = "debug")
-	InitdbSQLFiles                     []string // Paths to .sql files executed on each pgctld after initdb against the target database
-	InitdbSQLDirs                      []string // role:path entries; each dir's .sql files run under SET SESSION AUTHORIZATION <role> after initdb
-	PgInitdbArgs                       string   // Extra args forwarded to pgctld --pg-initdb-args (e.g., "--no-locale --encoding=SQL_ASCII" for pgregress)
-	PgInitdbExtraConfFiles             []string // postgresql.conf snippets live-included via --pg-initdb-extra-conf (e.g., locale overrides for pgregress)
+	MultipoolerCount                int
+	MultiorchCount                  int
+	EnableMultigateway              bool // Enable multigateway (opt-in, default: false)
+	EnableMultiadmin                bool // Enable multiadmin (opt-in, default: false)
+	EnableMultigatewayTLS           bool // Enable TLS for multigateway PostgreSQL listener
+	EnableMultipoolerPGTLS          bool // Provision postgres with TLS and point multipooler at it via verify-full
+	MultipoolerPGTLSDirect          bool // With EnableMultipoolerPGTLS: dial postgres with sslnegotiation=direct (PG 17 TLS-first)
+	Database                        string
+	TableGroup                      string
+	Shard                           string
+	CellName                        string
+	DurabilityPolicy                string   // Durability policy (e.g., "AT_LEAST_2")
+	SkipInitialization              bool     // Start processes but don't initialize postgres (for bootstrap tests)
+	DeferMultipoolerStart           bool     // Start pgctld only; test starts multipooler itself
+	RequireFailureSafeInitialCohort bool     // Reject bootstrapping a cohort that can't survive losing any member (default: false — tests allow it for speed/small pooler counts)
+	S3BackupBucket                  string   // S3 bucket name (empty = use filesystem)
+	S3BackupRegion                  string   // S3 region
+	S3BackupEndpoint                string   // S3 endpoint (empty = use AWS, otherwise s3mock/custom)
+	RequireBackupEncryption         bool     // Generate a cipher key file and require initial-repo encryption
+	EnableMultigatewayReplicaPort   bool     // Enable replica-reads port on multigateway
+	MultigatewayExtraArgs           []string // Extra CLI flags for multigateway (e.g., buffer config)
+	MultipoolerExtraArgs            []string // Extra CLI flags appended to every multipooler (e.g., connpool capacity/timeout flags)
+	OTelCollectorEndpoint           string   // OTLP HTTP endpoint for multigateway span export (empty = disabled)
+	EnableMetricsExport             bool     // Enable Prometheus metrics export on all services
+	LogLevel                        string   // --log-level for multipooler/multiorch/multigateway (empty = "debug")
+	InitdbSQLFiles                  []string // Paths to .sql files executed on each pgctld after initdb against the target database
+	InitdbSQLDirs                   []string // role:path entries; each dir's .sql files run under SET SESSION AUTHORIZATION <role> after initdb
+	PgInitdbArgs                    string   // Extra args forwarded to pgctld --pg-initdb-args (e.g., "--no-locale --encoding=SQL_ASCII" for pgregress)
+	PgInitdbExtraConfFiles          []string // postgresql.conf snippets live-included via --pg-initdb-extra-conf (e.g., locale overrides for pgregress)
 }
 
 // SetupOption is a function that configures setup creation.
@@ -251,16 +248,6 @@ func WithMultipoolerPGTLSDirect() SetupOption {
 	}
 }
 
-// WithLeaderFailoverGracePeriod sets the grace period configuration for leader failover.
-// Default is "0s" for both base and maxJitter to make tests run fast.
-// Use this to test grace period behavior explicitly.
-func WithLeaderFailoverGracePeriod(base, maxJitter string) SetupOption {
-	return func(c *SetupConfig) {
-		c.LeaderFailoverGracePeriodBase = base
-		c.LeaderFailoverGracePeriodMaxJitter = maxJitter
-	}
-}
-
 // WithRequireFailureSafeInitialCohort rejects bootstrapping a shard whose
 // initial cohort can't survive losing any single member, matching production
 // behavior. Tests default to allowing it (e.g. a 2-pooler AT_LEAST_2 setup
@@ -388,40 +375,6 @@ func WithPgInitdbExtraConfFiles(paths ...string) SetupOption {
 	}
 }
 
-// SetupTestConfig holds configuration for SetupTest.
-type SetupTestConfig struct {
-	NoReplication    bool     // Don't configure replication
-	PauseReplication bool     // Configure replication but pause WAL replay
-	GucsToReset      []string // GUCs to save before test and restore after
-}
-
-// SetupTestOption is a function that configures SetupTest behavior.
-type SetupTestOption func(*SetupTestConfig)
-
-// WithoutReplication returns an option that actively breaks replication.
-// Clears primary_conninfo and synchronous_standby_names, so tests can set up replication from scratch.
-func WithoutReplication() SetupTestOption {
-	return func(c *SetupTestConfig) {
-		c.NoReplication = true
-	}
-}
-
-// WithPausedReplication returns an option that pauses WAL replay on standbys.
-// Replication is already configured from bootstrap; this just pauses WAL application.
-// Use this for tests that need to test pg_wal_replay_resume().
-func WithPausedReplication() SetupTestOption {
-	return func(c *SetupTestConfig) {
-		c.PauseReplication = true
-	}
-}
-
-// WithResetGuc returns an option that saves and restores specific GUC settings.
-func WithResetGuc(gucNames ...string) SetupTestOption {
-	return func(c *SetupTestConfig) {
-		c.GucsToReset = append(c.GucsToReset, gucNames...)
-	}
-}
-
 // multipoolerName returns the name for a multipooler instance by index.
 // Uses generic names like "pooler-1", "pooler-2" since multiorch decides which becomes primary.
 func multipoolerName(index int) string {
@@ -532,32 +485,14 @@ func New(t *testing.T, opts ...SetupOption) *ShardSetup {
 		cancel()
 		t.Fatalf("failed to create etcd data directory: %v", err)
 	}
-	etcdClientAddr, etcdCmd, err := startEtcd(runningCtx, t, etcdDataDir)
+	etcdClientAddr, etcdCmd, err := clustersetup.StartEtcd(runningCtx, t, etcdDataDir)
 	if err != nil {
 		cancel()
 		t.Fatalf("failed to start etcd: %v", err)
 	}
 
 	// Create topology server and cell
-	testRoot := "/multigres"
-	globalRoot := path.Join(testRoot, "global")
-	cellRoot := path.Join(testRoot, config.CellName)
-
-	ts, err := topoclient.OpenServer(topoclient.DefaultTopoImplementation, globalRoot, []string{etcdClientAddr}, topoclient.NewDefaultTopoConfig())
-	if err != nil {
-		t.Fatalf("failed to open topology server: %v", err)
-	}
-
-	// Create the cell
-	err = ts.CreateCell(context.Background(), config.CellName, &clustermetadatapb.Cell{
-		ServerAddresses: []string{etcdClientAddr},
-		Root:            cellRoot,
-	})
-	if err != nil {
-		t.Fatalf("failed to create cell: %v", err)
-	}
-
-	t.Logf("Created topology cell '%s' at etcd %s", config.CellName, etcdClientAddr)
+	ts := clustersetup.CreateTopologyCell(t, etcdClientAddr, config.CellName)
 
 	// Create the database entry in topology with backup_location
 	var backupLocation *clustermetadatapb.BackupLocation
@@ -599,20 +534,9 @@ func New(t *testing.T, opts ...SetupOption) *ShardSetup {
 		t.Logf("Backup encryption required: cipher key file at %s", keyFilePath)
 	}
 
-	bootstrapPolicy, err := consensus.ParseUserSpecifiedDurabilityPolicy(config.DurabilityPolicy)
-	if err != nil {
+	if err := clustersetup.CreateDatabaseRecord(ts, config.Database, backupLocation, config.DurabilityPolicy); err != nil {
 		cancel()
-		t.Fatalf("invalid durability policy %q: %v", config.DurabilityPolicy, err)
-	}
-
-	err = ts.CreateDatabase(context.Background(), config.Database, &clustermetadatapb.Database{
-		Name:                      config.Database,
-		BackupLocation:            backupLocation,
-		BootstrapDurabilityPolicy: bootstrapPolicy,
-	})
-	if err != nil {
-		cancel()
-		t.Fatalf("failed to create database in topology: %v", err)
+		t.Fatalf("%v", err)
 	}
 
 	setup := &ShardSetup{
@@ -1055,7 +979,7 @@ func (s *ShardSetup) WaitForHealthStreamsEstablished(t *testing.T, orchName stri
 	for {
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		resp, err := client.GetShardStatus(ctx, &multiorchpb.ShardStatusRequest{
-			ShardKey: &clustermetadatapb.ShardKey{
+			ShardRef: &clustermetadatapb.ShardRef{
 				Database:   "postgres",
 				TableGroup: "default",
 				Shard:      "0-inf",
@@ -1485,76 +1409,6 @@ func startMultipoolerInstances(ctx context.Context, t *testing.T, instances []*M
 	}
 
 	t.Logf("Started %d processes without initialization (ready for bootstrap)", len(instances))
-}
-
-// startEtcd starts etcd without registering t.Cleanup() handlers
-// since cleanup is handled manually by TestMain via Cleanup().
-// Follows the pattern from multipooler/setup_test.go:startEtcdForSharedSetup.
-func startEtcd(ctx context.Context, t *testing.T, dataDir string) (string, *executil.Cmd, error) {
-	t.Helper()
-
-	ctx, span := telemetry.Tracer().Start(ctx, "shardsetup/startEtcd")
-	defer span.End()
-
-	// Check if etcd is available in PATH
-	_, err := exec.LookPath("etcd")
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "etcd not found in PATH")
-		return "", nil, fmt.Errorf("etcd not found in PATH: %w", err)
-	}
-
-	// Get ports for etcd (client, peer, and metrics)
-	clientPort := utils.GetFreePort(t)
-	peerPort := utils.GetFreePort(t)
-	metricsPort := utils.GetFreePort(t)
-
-	span.SetAttributes(
-		attribute.Int("etcd.client_port", clientPort),
-		attribute.Int("etcd.peer_port", peerPort),
-		attribute.Int("etcd.metrics_port", metricsPort),
-	)
-
-	name := "shardsetup_test"
-	clientAddr := fmt.Sprintf("http://localhost:%v", clientPort)
-	peerAddr := fmt.Sprintf("http://localhost:%v", peerPort)
-	metricsAddr := fmt.Sprintf("http://localhost:%v", metricsPort)
-	initialCluster := fmt.Sprintf("%v=%v", name, peerAddr)
-
-	// Wrap etcd with run_in_test.sh for orphan protection. Stops gracefully when
-	// runningCtx is cancelled so run_in_test.sh can terminate etcd cleanly.
-	cmd := utils.CommandWithOrphanProtection(ctx, "etcd",
-		"-name", name,
-		"-advertise-client-urls", clientAddr,
-		"-initial-advertise-peer-urls", peerAddr,
-		"-listen-client-urls", clientAddr,
-		"-listen-peer-urls", peerAddr,
-		"-listen-metrics-urls", metricsAddr,
-		"-initial-cluster", initialCluster,
-		"-data-dir", dataDir)
-
-	// Set MULTIGRES_TESTDATA_DIR for directory-deletion triggered cleanup
-	cmd.AddEnv("MULTIGRES_TESTDATA_DIR=" + dataDir)
-
-	if err := cmd.Start(); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "failed to start etcd")
-		return "", nil, fmt.Errorf("failed to start etcd: %w", err)
-	}
-
-	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := etcdtopo.WaitForReady(waitCtx, metricsAddr); err != nil {
-		// Stop the etcd process if it's not ready
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		_, _ = cmd.Stop(stopCtx)
-		stopCancel()
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "etcd not ready")
-		return "", nil, err
-	}
-
-	return clientAddr, cmd, nil
 }
 
 // ValidateCleanState checks that all multipoolers are in the expected clean state.
@@ -2389,7 +2243,7 @@ func logMultiorchStatus(ctx context.Context, t *testing.T, setup *ShardSetup, la
 		// Query shard status for the default shard
 		// TODO: Handle multiple shards if needed
 		resp, err := client.GetShardStatus(ctx, &multiorchpb.ShardStatusRequest{
-			ShardKey: &clustermetadatapb.ShardKey{
+			ShardRef: &clustermetadatapb.ShardRef{
 				Database:   "postgres",
 				TableGroup: constants.DefaultTableGroup, // "default" - must match multipooler registration
 				Shard:      constants.DefaultShard,      // "0-inf" - must match multipooler registration

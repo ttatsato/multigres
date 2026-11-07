@@ -37,7 +37,7 @@ import (
 )
 
 // NewTestMultipoolerManager builds a MultipoolerManager for tests with a
-// minimal Multipooler (MVP table_group/shard, a temp PoolerDir, and a valid
+// minimal Multipooler (default table_group/shard, a temp PoolerDir, and a valid
 // service ID). Tests override pm.record fields, pm.pgctldClient, etc.
 // as needed.
 func NewTestMultipoolerManager(t *testing.T) *MultipoolerManager {
@@ -48,7 +48,7 @@ func NewTestMultipoolerManager(t *testing.T) *MultipoolerManager {
 			Cell:      "test-cell",
 			Name:      "test-pooler",
 		},
-		ShardKey: &clustermetadatapb.ShardKey{
+		ShardRef: &clustermetadatapb.ShardRef{
 			TableGroup: "default",
 			Shard:      "0-inf",
 		},
@@ -165,7 +165,7 @@ func TestHelperMethods(t *testing.T) {
 
 		multipooler := &clustermetadatapb.Multipooler{
 			Id: serviceID,
-			ShardKey: &clustermetadatapb.ShardKey{
+			ShardRef: &clustermetadatapb.ShardRef{
 				Database:   "testdb",
 				TableGroup: "testgroup",
 				Shard:      "shard-123",
@@ -348,6 +348,14 @@ type mockPgctldClient struct {
 	pgRewindResponse   *pgctldpb.PgRewindResponse
 	pgRewindError      error
 	pgRewindCalls      int
+	// pgRewindOnCall, if set, runs on every PgRewind call.
+	pgRewindOnCall func(*pgctldpb.PgRewindRequest)
+	pgRewindReqs   []*pgctldpb.PgRewindRequest
+	// pgRewindAbortError is returned by PgRewindAbort; pgRewindAbortReqs records
+	// its calls and pgRewindAbortOnCall, if set, runs on each.
+	pgRewindAbortError  error
+	pgRewindAbortReqs   []*pgctldpb.PgRewindAbortRequest
+	pgRewindAbortOnCall func(*pgctldpb.PgRewindAbortRequest)
 }
 
 func (m *mockPgctldClient) Status(ctx context.Context, req *pgctldpb.StatusRequest, opts ...grpc.CallOption) (*pgctldpb.StatusResponse, error) {
@@ -416,6 +424,10 @@ func (m *mockPgctldClient) Version(ctx context.Context, req *pgctldpb.VersionReq
 
 func (m *mockPgctldClient) PgRewind(ctx context.Context, req *pgctldpb.PgRewindRequest, opts ...grpc.CallOption) (*pgctldpb.PgRewindResponse, error) {
 	m.pgRewindCalls++
+	m.pgRewindReqs = append(m.pgRewindReqs, req)
+	if m.pgRewindOnCall != nil {
+		m.pgRewindOnCall(req)
+	}
 	if m.pgRewindError != nil {
 		return m.pgRewindResponse, m.pgRewindError
 	}
@@ -423,6 +435,17 @@ func (m *mockPgctldClient) PgRewind(ctx context.Context, req *pgctldpb.PgRewindR
 		return m.pgRewindResponse, nil
 	}
 	return &pgctldpb.PgRewindResponse{}, nil
+}
+
+func (m *mockPgctldClient) PgRewindAbort(ctx context.Context, req *pgctldpb.PgRewindAbortRequest, opts ...grpc.CallOption) (*pgctldpb.PgRewindAbortResponse, error) {
+	m.pgRewindAbortReqs = append(m.pgRewindAbortReqs, req)
+	if m.pgRewindAbortOnCall != nil {
+		m.pgRewindAbortOnCall(req)
+	}
+	if m.pgRewindAbortError != nil {
+		return nil, m.pgRewindAbortError
+	}
+	return &pgctldpb.PgRewindAbortResponse{}, nil
 }
 
 func (m *mockPgctldClient) StopRestoreCommand(ctx context.Context, req *pgctldpb.StopRestoreCommandRequest, opts ...grpc.CallOption) (*pgctldpb.StopRestoreCommandResponse, error) {

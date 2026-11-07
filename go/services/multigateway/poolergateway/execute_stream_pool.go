@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/multigres/multigres/go/common/queryrpc"
 	pb "github.com/multigres/multigres/go/pb/multipoolerservice"
@@ -41,21 +42,23 @@ const (
 // streamPool retains only idle transport streams, never PostgreSQL connections.
 // Each lease is exclusive; reservations and callers remain request fields.
 type streamPool struct {
-	client      pb.MultipoolerServiceClient
-	ctx         context.Context
-	cancel      context.CancelFunc
-	m           *streamPoolMetrics
-	mu          sync.Mutex
-	idle        []*streamLease
-	closed      bool
-	unsupported atomic.Bool
+	client               pb.MultipoolerServiceClient
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	m                    *streamPoolMetrics
+	mu                   sync.Mutex
+	idle                 []*streamLease
+	closed               bool
+	cleanupGrace         time.Duration
+	perCallAuthorization atomic.Bool
 }
 
 type streamLease struct {
-	stream   pb.MultipoolerService_ExecuteStreamClient
-	cancel   context.CancelFunc
-	timer    *time.Timer
-	requests uint32
+	stream     pb.MultipoolerService_ExecuteStreamClient
+	cancel     context.CancelFunc
+	timer      *time.Timer
+	requests   uint32
+	operations map[pb.ExecuteStreamOperation]bool
 }
 
 // streamStateConn is the connectivity view of the *grpc.ClientConn carrying the
@@ -74,7 +77,7 @@ func newStreamPool(client pb.MultipoolerServiceClient, conn streamStateConn) *st
 	// The transport has an explicit Close lifecycle and must not inherit any
 	// caller's values, credentials, deadline or cancellation after lease return.
 	ctx, cancel := context.WithCancel(context.Background()) //nolint:gocritic // pool-owned lifecycle, not a detached request
-	p := &streamPool{client: client, ctx: ctx, cancel: cancel, m: streamMetrics()}
+	p := &streamPool{client: client, ctx: ctx, cancel: cancel, m: streamMetrics(), cleanupGrace: operationCleanupGrace}
 	if conn != nil {
 		go p.watch(conn)
 	}
@@ -200,31 +203,53 @@ func (p *streamPool) put(l *streamLease) {
 // streamResponses exposes the same receive contract as the old server-streaming RPC.
 // A completion frame is translated to EOF or its original gRPC status/details.
 type streamResponses struct {
-	lease    *streamLease
-	done     bool
-	stop     func() bool
-	pool     *streamPool
-	ctx      context.Context
-	released bool
+	lease     *streamLease
+	done      bool
+	stop      func() bool
+	pool      *streamPool
+	ctx       context.Context
+	released  bool
+	operation pb.ExecuteStreamOperation
+	invalid   bool
+	retire    bool
 }
 
 func (r *streamResponses) Recv() (*pb.StreamExecuteResponse, error) {
+	return receiveTyped[*pb.StreamExecuteResponse](r)
+}
+
+func (r *streamResponses) protocolError(message string) error {
+	r.invalid = true
+	return r.incomplete(status.Error(codes.Internal, message))
+}
+
+// recv validates framing and operation identity before exposing a response.
+// Handler status/details are passed through unchanged, including unary errors.
+func (r *streamResponses) recv() (proto.Message, error) {
 	if r.done || r.released {
 		return nil, io.EOF
 	}
 	f, err := r.lease.stream.Recv()
 	if err != nil {
-		return nil, incompleteOperation(err)
+		return nil, r.incomplete(err)
 	}
-	if f.Ready || (f.Response == nil) == (f.Completion == nil) {
-		return nil, status.Error(codes.Internal, "invalid execute stream response")
+	if f.Ready || len(f.SupportedOperations) != 0 || (f.Retire && f.Completion == nil) || (f.Result == nil) == (f.Completion == nil) {
+		return nil, r.protocolError("invalid execute stream response")
 	}
-	if f.Response != nil {
-		return f.Response, nil
+	if f.Result != nil {
+		op, response := queryrpc.Response(f)
+		if op != r.operation || response == nil {
+			return nil, r.protocolError("execute stream response does not match operation")
+		}
+		return response, nil
 	}
 	r.done = true
+	r.retire = f.Retire
 	if c := f.Completion; c.GetCode() != int32(codes.OK) {
-		return nil, status.FromProto(c).Err()
+		return nil, completedTimeout(r.ctx, status.FromProto(c).Err())
+	}
+	if err := completedTimeout(r.ctx, nil); err != nil {
+		return nil, err
 	}
 	return nil, io.EOF
 }
@@ -244,9 +269,12 @@ func (r *streamResponses) Release() {
 	case !stopped || r.ctx.Err() != nil:
 		r.lease.cancel()
 		p.m.discards.Add(p.ctx, 1, discardAttr[discardCancelled])
-	case !r.done:
+	case !r.done || r.invalid:
 		r.lease.cancel()
 		p.m.discards.Add(p.ctx, 1, discardAttr[discardIncomplete])
+	case r.retire:
+		r.lease.cancel()
+		p.m.discards.Add(p.ctx, 1, discardAttr[discardRetired])
 	default:
 		p.put(r.lease)
 	}
@@ -256,8 +284,19 @@ func (r *streamResponses) Release() {
 // sent. The caller must NOT retry a returned error after used=true. In
 // particular, even Send returning EOF is ambiguous and cannot be replayed.
 func (p *streamPool) Open(ctx context.Context, req *pb.StreamExecuteRequest) (*streamResponses, bool, error) {
-	if p.unsupported.Load() {
-		p.m.operations.Add(p.ctx, 1, attrLegacyUnsupported)
+	return p.open(ctx, queryrpc.Request(req))
+}
+
+// open handles all typed operations with the same exclusive lease and retry
+// boundary. Dedicated RPCs are selected only for per-call metadata/authorization
+// or propagation that cannot be carried by the operation envelope.
+func (p *streamPool) open(ctx context.Context, frame *pb.ExecuteStreamRequest) (*streamResponses, bool, error) {
+	operation := queryrpc.Operation(frame)
+	if operation == pb.ExecuteStreamOperation_EXECUTE_STREAM_OPERATION_UNSPECIFIED {
+		return nil, false, status.Error(codes.InvalidArgument, "missing execute stream operation")
+	}
+	if p.perCallAuthorization.Load() {
+		p.m.operations.Add(p.ctx, 1, attrLegacyAuthorization)
 		return nil, false, nil
 	}
 	// Credentials/custom RPC metadata belong to individual calls. Preserve
@@ -283,11 +322,11 @@ func (p *streamPool) Open(ctx context.Context, req *pb.StreamExecuteRequest) (*s
 		// The caller's cancellation/deadline governs the handshake too; the
 		// stream itself stays pool-owned once the lease is returned.
 		stop = context.AfterFunc(ctx, cancel)
+		var ready *pb.ExecuteStreamResponse
 		stream, err := p.client.ExecuteStream(streamCtx)
 		if err == nil {
-			var ready *pb.ExecuteStreamResponse
 			ready, err = stream.Recv()
-			if err == nil && (!ready.Ready || ready.Response != nil || ready.Completion != nil) {
+			if err == nil && (!ready.Ready || ready.Result != nil || ready.Completion != nil || ready.Retire) {
 				err = status.Error(codes.Internal, "missing execute stream handshake")
 			}
 		}
@@ -299,42 +338,75 @@ func (p *streamPool) Open(ctx context.Context, req *pb.StreamExecuteRequest) (*s
 				// caller's own deadline/cancellation, not the derived cancel.
 				return nil, false, status.FromContextError(ctxErr).Err()
 			}
-			if status.Code(err) == codes.Unimplemented {
-				p.unsupported.Store(true)
-				p.m.operations.Add(p.ctx, 1, attrLegacyUnsupported)
+			if queryrpc.RequiresPerCallAuthorization(err) {
+				p.perCallAuthorization.Store(true)
+				p.m.operations.Add(p.ctx, 1, attrLegacyAuthorization)
 				return nil, false, nil
 			}
 			// No SQL has been sent, but leave classification to the caller.
 			return nil, false, err
 		}
-		l = &streamLease{stream: stream, cancel: cancel}
+		l = &streamLease{stream: stream, cancel: cancel, operations: make(map[pb.ExecuteStreamOperation]bool)}
+		for _, op := range ready.SupportedOperations {
+			l.operations[op] = true
+		}
 	} else {
 		stop = context.AfterFunc(ctx, l.cancel)
 	}
+	if !l.operations[operation] {
+		// Stop this caller's cancellation hook before retaining the unused
+		// stream. A callback already running makes the lease unsafe to reuse.
+		if !stop() || ctx.Err() != nil {
+			l.cancel()
+		} else {
+			p.put(l)
+		}
+		return nil, false, status.Errorf(codes.Unimplemented, "pooler does not support ExecuteStream operation %s", operation)
+	}
+	// The handshake uses immediate cancellation. Switch only before submission,
+	// while it is still safe to stop without needing a completion acknowledgement.
+	if !stop() || ctx.Err() != nil {
+		l.cancel()
+		return nil, true, status.FromContextError(ctx.Err()).Err()
+	}
+	stop = watchOperation(ctx, l.cancel, p.cleanupGrace)
 	l.requests++
 	p.m.operations.Add(p.ctx, 1, transport)
 	p.m.active.Add(p.ctx, 1)
-	r := &streamResponses{lease: l, stop: stop, pool: p, ctx: ctx}
-	if err := l.stream.Send(requestFrame(ctx, req, carrier)); err != nil {
+	r := &streamResponses{lease: l, stop: stop, pool: p, ctx: ctx, operation: operation}
+	frame.Propagation = carrier
+	if deadline, ok := ctx.Deadline(); ok {
+		frame.TimeoutNanos = max(1, int64(time.Until(deadline)))
+	}
+	if err := l.stream.Send(frame); err != nil {
 		r.Release()
-		return nil, true, incompleteOperation(err)
+		return nil, true, r.incomplete(err)
 	}
 	return r, true, nil
 }
 
-func incompleteOperation(err error) error {
+func incompleteOperation(ctx context.Context, err error) error {
 	// Unlike the legacy server-streaming RPC, transport EOF is NOT an SQL
 	// success here. Only an explicit completion frame proves completion.
 	if errors.Is(err, io.EOF) {
 		return status.Error(codes.Unavailable, "execute stream ended before operation completion")
 	}
+	// The lease's transport context (streamCtx in Open/take) is a plain
+	// context.WithCancel driven by an AfterFunc on the caller's ctx, so a caller
+	// deadline always surfaces here as a generic Canceled rather than
+	// DeadlineExceeded — the real cause is lost crossing that derivation.
+	// Recover it from the caller's own ctx, mirroring the handshake-failure
+	// path above, so a statement timeout is never misreported as an explicit
+	// cancel (SQLSTATE/message: "canceling statement due to user request").
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return status.FromContextError(ctxErr).Err()
+	}
 	return err
 }
 
-func requestFrame(ctx context.Context, req *pb.StreamExecuteRequest, carrier map[string]string) *pb.ExecuteStreamRequest {
-	f := &pb.ExecuteStreamRequest{Request: req, Propagation: carrier}
-	if deadline, ok := ctx.Deadline(); ok {
-		f.TimeoutNanos = max(1, int64(time.Until(deadline)))
+func (r *streamResponses) incomplete(err error) error {
+	if errors.Is(r.ctx.Err(), context.DeadlineExceeded) {
+		return completionUnconfirmed()
 	}
-	return f
+	return incompleteOperation(r.ctx, err)
 }

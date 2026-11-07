@@ -39,6 +39,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -173,17 +175,6 @@ func (s *PgCtldServerCmd) runServer(cmd *cobra.Command, args []string) error {
 			"http_port", s.senv.GetHTTPPort(),
 		)
 
-		// Start reaping the postmaster to prevent a zombie. Only needed when
-		// pgctld is PID 1 (container init): `pg_ctl start -W` forks the postmaster
-		// and exits, so it is reparented to pgctld and must be wait()ed on. When
-		// pgctld is NOT PID 1 (tests, CI, systemd) orphans reparent to the system
-		// init instead, so no reaper is needed. See childReaper for why it tracks
-		// exact PIDs rather than using Wait4(-1).
-		if os.Getpid() == 1 {
-			pgctldService.reaper = newChildReaper(logger)
-			go pgctldService.reaper.Run()
-		}
-
 		// Start pgBackRest management
 		pgctldService.StartPgBackRestManagement()
 
@@ -242,6 +233,10 @@ type PgCtldService struct {
 	// caching, invalidation, and probe-ordering semantics).
 	gucCache *gucProbeCache
 
+	// rewindRuns tracks the running mutating pg_rewind and fenced run ids; see
+	// PgRewindAbort.
+	rewindRuns rewindRuns
+
 	// pgBackRest management
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -251,9 +246,6 @@ type PgCtldService struct {
 	statusMu         sync.RWMutex
 	restartCount     int32
 	metrics          *Metrics
-
-	// reaper reaps the postmaster when pgctld runs as PID 1. Nil otherwise.
-	reaper *childReaper
 }
 
 // pgbackrestServerConfigPath returns the path to the pgbackrest server config file.
@@ -580,6 +572,13 @@ func (s *PgCtldService) Start(ctx context.Context, req *pb.StartRequest) (*pb.St
 		return nil, fmt.Errorf("data directory not initialized: %s. Run 'pgctld init' first", dataDir)
 	}
 
+	// Refuse during an incomplete restore before the standby.signal change and
+	// crash recovery below touch the data directory. StartPostgreSQLWithResult
+	// checks again for the start command.
+	if err := checkNoIncompleteRestore(s.pgConfig.PoolerDir); err != nil {
+		return nil, err
+	}
+
 	// Select the start mode for this existing data directory. Default (as_primary
 	// false) writes standby.signal so postgres comes up in recovery (standby) mode
 	// and never as a writable primary on its own; as_primary removes it for a
@@ -653,9 +652,6 @@ func (s *PgCtldService) Start(ctx context.Context, req *pb.StartRequest) (*pb.St
 		return nil, fmt.Errorf("failed to start PostgreSQL: %w", err)
 	}
 
-	// Reap this postmaster when it exits (no-op unless pgctld is PID 1).
-	s.reaper.TrackPID(result.PID)
-
 	pid, err := intToInt32(result.PID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid PID: %w", err)
@@ -703,9 +699,6 @@ func (s *PgCtldService) Restart(ctx context.Context, req *pb.RestartRequest) (*p
 	if err != nil {
 		return nil, fmt.Errorf("failed to restart PostgreSQL: %w", err)
 	}
-
-	// Reap the restarted postmaster when it exits (no-op unless pgctld is PID 1).
-	s.reaper.TrackPID(result.PID)
 
 	pid, err := intToInt32(result.PID)
 	if err != nil {
@@ -873,17 +866,47 @@ func (s *PgCtldService) PgRewind(ctx context.Context, req *pb.PgRewindRequest) (
 		"source_port", req.GetSourcePort(),
 		"dry_run", req.GetDryRun())
 
+	// Tell the pooler while a mutating pg_rewind runs, so that after a failed call
+	// it can wait until the process has exited before judging what it modified. A
+	// call that failed on a timeout can return before the process is gone. The record
+	// is written before the crash recovery below, which also writes to the data
+	// directory and can be cut short in the same way.
+	//
+	// The run is also registered under its id, which PgRewindAbort uses to fence it:
+	// a request whose id was fenced before it got here is refused, and one that is
+	// running is terminated through runCtx. The registration is released after the
+	// record is removed, so that an abort that returns means the record is gone too.
+	runCtx := ctx
+	if !req.GetDryRun() {
+		var finish func()
+		var err error
+		runCtx, finish, err = s.rewindRuns.begin(ctx, req.GetRunId())
+		if err != nil {
+			return nil, err
+		}
+		defer finish()
+		running := filepath.Join(s.pgConfig.PoolerDir, constants.RewindRunningFile)
+		if err := os.WriteFile(running, []byte("pg_rewind running\n"), 0o644); err != nil {
+			return nil, fmt.Errorf("failed to record that pg_rewind is running: %w", err)
+		}
+		defer func() {
+			if err := os.Remove(running); err != nil && !os.IsNotExist(err) {
+				s.logger.ErrorContext(ctx, "failed to remove pg_rewind running marker", "path", running, "error", err)
+			}
+		}()
+	}
+
 	// Check if postgres is cleanly stopped before pg_rewind
 	// If not, try crash recovery - this is needed for rewind dry-run to work
 	// This check is best effort. It's not harmful to try the pg_rewind if
 	// crash recovery fails, the dry run is just unlikely to succeed in that case.
-	cleanlyStopped, err := s.isPostgresCleanlyStopped(ctx)
+	cleanlyStopped, err := s.isPostgresCleanlyStopped(runCtx)
 	if err != nil {
 		s.logger.WarnContext(ctx, "failed to check postgres state (continuing anyway)", "error", err)
 	} else if !cleanlyStopped {
 		// Try to run crash recovery.
 		// It's not harmful to do this if postgres is already running.
-		if err := s.runCrashRecovery(ctx); err != nil {
+		if err := s.runCrashRecovery(runCtx); err != nil {
 			s.logger.WarnContext(ctx, "crash recovery failed (continuing anyway)", "error", err)
 		}
 	}
@@ -900,7 +923,7 @@ func (s *PgCtldService) PgRewind(ctx context.Context, req *pb.PgRewindRequest) (
 	}
 
 	// Use the shared rewind function with detailed result, passing password separately
-	result, err := PgRewindWithResult(ctx, s.logger, sourceServer, s.ctldConfig.Password, req.GetDryRun(), req.GetExtraArgs())
+	result, err := PgRewindWithResult(runCtx, s.logger, sourceServer, s.ctldConfig.Password, req.GetDryRun(), req.GetExtraArgs())
 	if err != nil {
 		s.logger.ErrorContext(ctx, "pg_rewind output", "output", result.Output)
 		return nil, fmt.Errorf("failed to rewind PostgreSQL: %w", err)
@@ -910,6 +933,22 @@ func (s *PgCtldService) PgRewind(ctx context.Context, req *pb.PgRewindRequest) (
 		Message: result.Message,
 		Output:  result.Output,
 	}, nil
+}
+
+// PgRewindAbort fences the run id and makes sure the pg_rewind registered under
+// it is not running, terminating it if it is. A PgRewind request with that id
+// that arrives afterwards is refused. It returns once the process has exited and
+// its running record is gone, so the caller can judge the data directory.
+func (s *PgCtldService) PgRewindAbort(ctx context.Context, req *pb.PgRewindAbortRequest) (*pb.PgRewindAbortResponse, error) {
+	if req.GetRunId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "run_id is required")
+	}
+	s.logger.InfoContext(ctx, "gRPC PgRewindAbort request", "run_id", req.GetRunId())
+	terminated, err := s.rewindRuns.abort(ctx, req.GetRunId())
+	if err != nil {
+		return nil, fmt.Errorf("pg_rewind run %s is still running: %w", req.GetRunId(), err)
+	}
+	return &pb.PgRewindAbortResponse{Terminated: terminated}, nil
 }
 
 // stopRestoreCommandGracePeriod gives the wrapper enough time to exhaust its
